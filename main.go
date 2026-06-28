@@ -1,37 +1,25 @@
 package main
 
 import (
+	"belly-ledger/db"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
+	log "github.com/sirupsen/logrus"
 	genai "google.golang.org/genai"
+	"gorm.io/gorm"
 )
-
-const (
-	TargetCalories = 2202
-	TargetProtein  = 165
-	TargetFats     = 73
-	TargetCarbs    = 220
-)
-
-type DailyNutrition struct {
-	Calories int
-	Protein  int
-	Fats     int
-	Carbs    int
-	Date     string
-}
 
 type GeminiResponse struct {
 	FoodDescription        string `json:"food_description"`
@@ -42,15 +30,30 @@ type GeminiResponse struct {
 	HealthinessExplanation string `json:"healthiness"`
 }
 
-var (
-	nutritionMutex sync.Mutex
-	userNutrition  = make(map[int64]*DailyNutrition)
-)
+type PendingReply struct {
+	ChatID           int64
+	UserID           int64
+	ReplyToMessageID int
+	Kind             string
+}
 
 func main() {
 	loadEnv()
+	var pendingReplies = map[int64]PendingReply{} // key: telegram user id
+
+	database, err := db.Connect("belly.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	telegramToken := os.Getenv("TELEGRAMTOKEN")
 	geminiKey := os.Getenv("GEMINIKEY")
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+		DisableSorting:  false,
+		DisableQuote:    true,
+	})
 
 	if telegramToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
@@ -85,127 +88,31 @@ func main() {
 			continue
 		}
 
-		var fileID string
-		var mimeType string
-		var prompt string
-		var unsupportedType string
+		messageText := update.Message.Text
 		chatID := update.Message.Chat.ID
 
-		if update.Message.Sticker != nil {
-			unsupportedType = "stickers"
-		} else if len(update.Message.Photo) > 0 {
-			// Get largest photo size
-			fileID = update.Message.Photo[len(update.Message.Photo)-1].FileID
-			mimeType = "image/jpeg"
-			prompt = update.Message.Caption
-		} else if update.Message.Document != nil && strings.HasPrefix(update.Message.Document.MimeType, "image/") {
-			fileID = update.Message.Document.FileID
-			mimeType = update.Message.Document.MimeType
-			prompt = update.Message.Caption
-		} else if update.Message.Text != "" {
-			prompt = update.Message.Text
-		} else if update.Message.Voice != nil || update.Message.Audio != nil {
-			unsupportedType = "audio/voice messages"
-		} else if update.Message.Video != nil || update.Message.VideoNote != nil {
-			unsupportedType = "video messages"
-		} else if update.Message.Animation != nil {
-			unsupportedType = "animations/GIFs"
-		} else if update.Message.Location != nil {
-			unsupportedType = "locations"
-		} else if update.Message.Contact != nil {
-			unsupportedType = "contacts"
-		} else {
-			unsupportedType = "this type of message"
+		if messageText == "/start" {
+			startMessage(bot, database, update, chatID, pendingReplies)
+			continue
 		}
 
-		// If it's a text-only message, check if it doesn't contain alphanumeric characters (e.g. only emojis/symbols)
-		if fileID == "" && unsupportedType == "" && !containsAlphanumeric(prompt) {
-			unsupportedType = "emoji-only or symbol-only messages"
-		}
-
-		if unsupportedType != "" {
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("I cannot process %s.", unsupportedType))
-			if _, err := bot.Send(msg); err != nil {
-				log.Printf("failed to send message: %v", err)
+		pending, hasPending := pendingReplies[update.Message.From.ID]
+		if hasPending &&
+			update.Message.ReplyToMessage != nil &&
+			update.Message.ReplyToMessage.MessageID == pending.ReplyToMessageID &&
+			pending.Kind == "user_profile" {
+			err := processPendingReply(bot, database, update, pendingReplies)
+			if err != nil {
+				continue
 			}
 			continue
 		}
 
-		if prompt == "/start" {
-			msg := tgbotapi.NewMessage(chatID, "Hi! Send me a question or a photo, and I will ask Gemini.")
-			bot.Send(msg)
-			continue
-		}
-
-		// Send initial processing message
-		processingMsg, sendErr := bot.Send(tgbotapi.NewMessage(chatID, "Processing your request..."))
-		if sendErr != nil {
-			log.Printf("failed to send processing message: %v", sendErr)
-		}
-
-		var imgData []byte
-		if fileID != "" {
-			// Download image from Telegram
-			fileURL, err := bot.GetFileDirectURL(fileID)
-			if err != nil {
-				log.Printf("failed to get file direct URL: %v", err)
-				updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error getting image URL from Telegram.")
-				continue
-			}
-
-			resp, err := http.Get(fileURL)
-			if err != nil {
-				log.Printf("failed to download image: %v", err)
-				updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error downloading image.")
-				continue
-			}
-			defer resp.Body.Close()
-
-			imgData, err = io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("failed to read image bytes: %v", err)
-				updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error reading image data.")
-				continue
-			}
-		}
-
-		result, err := askGemini(ctx, aiClient, prompt, imgData, mimeType)
-		var replyText string
+		err := processMealRequest(bot, database, update, chatID, ctx, aiClient)
 		if err != nil {
-			replyText = fmt.Sprintf("Error: %v", err)
-		} else {
-			nutritionMutex.Lock()
-			currentDate := time.Now().Format("2006-01-02")
-			stats, exists := userNutrition[chatID]
-			if !exists || stats.Date != currentDate {
-				stats = &DailyNutrition{Date: currentDate}
-				userNutrition[chatID] = stats
-			}
-			stats.Calories += result.Calories
-			stats.Protein += result.Protein
-			stats.Fats += result.Fats
-			stats.Carbs += result.Carbs
-			nutritionMutex.Unlock()
-
-			percentage := int(float64(stats.Calories) / float64(TargetCalories) * 100.0)
-			left := TargetCalories - stats.Calories
-			if left < 0 {
-				left = 0
-			}
-
-			replyText = fmt.Sprintf("⏰ %s\n📝 %s\n🔥 %d kcal | Protein %dg | Fats %dg | Carbs %dg\n\n\nHealthiness: %s\n\nDaily target: %d/%d kcal (%d%%), left %d kcal\nProtein: %d/%dg\nFats: %d/%dg\nCarbs: %d/%dg",
-				time.Now().Format("15:04"),
-				result.FoodDescription,
-				result.Calories, result.Protein, result.Fats, result.Carbs,
-				result.HealthinessExplanation,
-				stats.Calories, TargetCalories, percentage, left,
-				stats.Protein, TargetProtein,
-				stats.Fats, TargetFats,
-				stats.Carbs, TargetCarbs,
-			)
+			continue
 		}
 
-		updateOrSendMessage(bot, chatID, processingMsg.MessageID, replyText)
 	}
 }
 
@@ -260,10 +167,20 @@ Return the analysis as a JSON object with the requested schema.`
 		ResponseSchema:    schema,
 	}
 
-	resp, err := client.Models.GenerateContent(ctx, "gemini-3.5-flash", contents, config)
+	resp, err := client.Models.GenerateContent(ctx, "gemini-3.1-flash-lite", contents, config)
 	if err != nil {
 		return GeminiResponse{}, err
 	}
+	geminiMetadata := log.Fields{
+		"CandidatesTokenCount":    resp.UsageMetadata.CandidatesTokenCount,
+		"PromptTokenCount":        resp.UsageMetadata.PromptTokenCount,
+		"ThoughtsTokenCount":      resp.UsageMetadata.ThoughtsTokenCount,
+		"TotalTokenCount":         resp.UsageMetadata.TotalTokenCount,
+		"ToolUsePromptTokenCount": resp.UsageMetadata.ToolUsePromptTokenCount,
+		"ModelVersion":            resp.ModelVersion,
+		"ResponseID":              resp.ResponseID,
+	}
+	log.WithFields(geminiMetadata).Info("Gemini response metadata")
 
 	text := strings.TrimSpace(resp.Text())
 	if text == "" {
@@ -289,16 +206,29 @@ func cleanJSON(s string) string {
 	return s
 }
 
+func bmiCategory(bmi float64) string {
+	switch {
+	case bmi < 18.5:
+		return "underweight"
+	case bmi < 25:
+		return "normal"
+	case bmi < 30:
+		return "overweight"
+	default:
+		return "obese"
+	}
+}
+
 func updateOrSendMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	if messageID != 0 {
 		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
 		if _, err := bot.Send(editMsg); err != nil {
-			log.Printf("failed to edit message: %v", err)
+			log.Errorf("failed to edit message: %v", err)
 		}
 	} else {
 		msg := tgbotapi.NewMessage(chatID, text)
 		if _, err := bot.Send(msg); err != nil {
-			log.Printf("failed to send message: %v", err)
+			log.Errorf("failed to send message: %v", err)
 		}
 	}
 }
@@ -310,4 +240,241 @@ func containsAlphanumeric(s string) bool {
 		}
 	}
 	return false
+}
+
+func handleUserProfileReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update) error {
+	parts := strings.Fields(strings.TrimSpace(strings.ToLower(update.Message.Text)))
+	if len(parts) != 4 {
+		return fmt.Errorf("invalid format")
+	}
+
+	height, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return err
+	}
+
+	weight, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return err
+	}
+
+	age, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return err
+	}
+
+	gender := parts[3]
+	if strings.ToLower(gender) != "m" && strings.ToLower(gender) != "f" {
+		return fmt.Errorf("invalid gender")
+	}
+	user, err := database.GetUserByTelegramID(update.Message.From.ID)
+	var newUser *db.User
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			newUser, err = database.AddUser(update.Message.From.ID, update.Message.From.FirstName, height, weight, age, gender)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		if err := database.UpdateUserData(update.Message.From.ID, height, weight, age, gender); err != nil {
+			return err
+		}
+		_ = user
+	}
+
+	genderLine := "♂️ Male"
+	if gender == "f" {
+		genderLine = "♀️ Female"
+	}
+	text := fmt.Sprintf(
+		"✅ Profile saved\n"+
+			"📏 %d cm\n"+
+			"⚖️ %d kg\n"+
+			"🎂 %d years\n"+
+			"%s\n"+
+			"BMI: %.1f (%s)\n"+
+			"📐 Calculation using Mifflin-St Jeor formula",
+		height,
+		weight,
+		age,
+		genderLine,
+		newUser.BMI,
+		bmiCategory(newUser.BMI),
+	)
+
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID, text)
+	_, _ = bot.Send(msg)
+
+	return nil
+}
+
+func startMessage(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, chatID int64, pendingReplies map[int64]PendingReply) {
+	msg := tgbotapi.NewMessage(chatID, "Hi! I'm FoodBot - your personal nutrition assistant.\n\nI accept both food photos and text meal descriptions.\n\n📸 Send me a food photo or describe what you ate, and I will:\n• Identify composition and calories\n• Save data to your profile\n• Give recommendations")
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("send welcome error:", err)
+	}
+
+	_, err := database.GetUserByTelegramID(update.Message.From.ID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			text := "Send height, weight, age and gender (m/f) in one message.\n\n" +
+				"Examples:\n" +
+				"180 75 25 m\n" +
+				"165 60 30 f\n\n" +
+				"ℹ️ Age and gender are needed for accurate calorie calculation using Mifflin-St Jeor formula. Without them, a simplified calculation is used."
+
+			replyMsg := tgbotapi.NewMessage(chatID, text)
+			replyMsg.ReplyMarkup = tgbotapi.ForceReply{
+				ForceReply:            true,
+				InputFieldPlaceholder: "180 75 25 m",
+				Selective:             true,
+			}
+			replyMsg.ReplyToMessageID = update.Message.MessageID
+
+			sent, sendErr := bot.Send(replyMsg)
+
+			if sendErr == nil {
+				pendingReplies[update.Message.From.ID] = PendingReply{
+					ChatID:           chatID,
+					UserID:           update.Message.From.ID,
+					ReplyToMessageID: sent.MessageID,
+					Kind:             "user_profile",
+				}
+			} else {
+				log.Warning("send welcome error:", sendErr)
+			}
+
+		} else {
+			errMsg := tgbotapi.NewMessage(chatID, "Sorry, I couldn't check your profile right now.")
+			bot.Send(errMsg)
+		}
+	}
+}
+
+func processPendingReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, pendingReplies map[int64]PendingReply) error {
+	err := handleUserProfileReply(bot, database, update)
+	if err != nil {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Couldn't parse that. Use format: 180 75 25 m")
+		bot.Send(msg)
+		return err
+	}
+
+	delete(pendingReplies, update.Message.From.ID)
+	return nil
+}
+
+func processMealRequest(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, chatID int64, ctx context.Context, aiClient *genai.Client) error {
+	var fileID string
+	var mimeType string
+	var prompt string
+	var unsupportedType string
+
+	user, err := database.GetUserByTelegramID(chatID)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "You need register your profile first /start"))
+		return nil
+	}
+	if update.Message.Sticker != nil {
+		unsupportedType = "stickers"
+	} else if len(update.Message.Photo) > 0 {
+		// Get largest photo size
+		fileID = update.Message.Photo[len(update.Message.Photo)-1].FileID
+		mimeType = "image/jpeg"
+		prompt = update.Message.Caption
+	} else if update.Message.Document != nil && strings.HasPrefix(update.Message.Document.MimeType, "image/") {
+		fileID = update.Message.Document.FileID
+		mimeType = update.Message.Document.MimeType
+		prompt = update.Message.Caption
+	} else if update.Message.Text != "" {
+		prompt = update.Message.Text
+	} else if update.Message.Voice != nil || update.Message.Audio != nil {
+		unsupportedType = "audio/voice messages"
+	} else if update.Message.Video != nil || update.Message.VideoNote != nil {
+		unsupportedType = "video messages"
+	} else if update.Message.Animation != nil {
+		unsupportedType = "animations/GIFs"
+	} else if update.Message.Location != nil {
+		unsupportedType = "locations"
+	} else if update.Message.Contact != nil {
+		unsupportedType = "contacts"
+	} else {
+		unsupportedType = "this type of message"
+	}
+
+	// If it's a text-only message, check if it doesn't contain alphanumeric characters (e.g. only emojis/symbols)
+	if fileID == "" && unsupportedType == "" && !containsAlphanumeric(prompt) {
+		unsupportedType = "emoji-only or symbol-only messages"
+	}
+
+	if unsupportedType != "" {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("I cannot process %s.", unsupportedType))
+		if _, err := bot.Send(msg); err != nil {
+			log.Warningf("failed to send message: %v", err)
+		}
+	}
+
+	// Send initial processing message
+	processingMsg, sendErr := bot.Send(tgbotapi.NewMessage(chatID, "Processing your request..."))
+	if sendErr != nil {
+		log.Warningf("failed to send processing message: %v", sendErr)
+	}
+
+	var imgData []byte
+	if fileID != "" {
+		// Download image from Telegram
+		fileURL, err := bot.GetFileDirectURL(fileID)
+		if err != nil {
+			log.Warningf("failed to get file direct URL: %v", err)
+			updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error getting image URL from Telegram.")
+			return err
+		}
+
+		resp, err := http.Get(fileURL)
+		if err != nil {
+			log.Warningf("failed to download image: %v", err)
+			updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error downloading image.")
+			return err
+		}
+		defer resp.Body.Close()
+
+		imgData, err = io.ReadAll(resp.Body)
+		if err != nil {
+			log.Warningf("failed to read image bytes: %v", err)
+			updateOrSendMessage(bot, chatID, processingMsg.MessageID, "Error reading image data.")
+			return err
+		}
+	}
+
+	result, err := askGemini(ctx, aiClient, prompt, imgData, mimeType)
+
+	var replyText string
+	if err != nil {
+		replyText = fmt.Sprintf("Error: %v", err)
+	} else {
+		err := database.AddMeal(user.ID, result.FoodDescription, result.HealthinessExplanation, result.Calories, result.Protein, result.Fats, result.Carbs)
+		if err != nil {
+			log.Errorf("Processing meal error: %v", err)
+		}
+
+		totalCalories, err := database.GetCaloriesToday(user.ID)
+		if err != nil {
+			log.Errorf("Get calories today error: %v", err)
+		}
+
+		replyText = fmt.Sprintf("⏰ %s\n📝 %s\n🔥 %d kcal | Protein %dg | Fats %dg | Carbs %dg\n\n\nHealthiness: %s\n\nDaily target: %d/%d kcal",
+			time.Now().Format("15:04"),
+			result.FoodDescription,
+			result.Calories, result.Protein, result.Fats, result.Carbs,
+			result.HealthinessExplanation,
+			totalCalories,
+			user.Goal,
+		)
+	}
+
+	updateOrSendMessage(bot, chatID, processingMsg.MessageID, replyText)
+	return nil
 }
