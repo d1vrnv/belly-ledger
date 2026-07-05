@@ -166,7 +166,7 @@ func askGemini(ctx context.Context, client *genai.Client, prompt string, imgData
 	}
 
 	systemPrompt := `You are a nutrition expert. Analyze the user's input (a food description or a photo of a meal) and estimate its nutritional content.
-Return the analysis as a JSON object with the requested schema.`
+Return the analysis as a JSON object with the requested schema. Healthiness should start with a color emoji representing the healthiness (red bad, green good) in gradient. Also add more details for healthiness.`
 
 	schema := &genai.Schema{
 		Type: genai.TypeObject,
