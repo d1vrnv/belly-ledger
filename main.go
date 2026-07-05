@@ -41,7 +41,7 @@ func main() {
 	loadEnv()
 	var pendingReplies = map[int64]PendingReply{} // key: telegram user id
 
-	database, err := db.Connect("belly.db")
+	database, err := db.Connect("./data/belly.db")
 	if err != nil {
 		log.Fatal(err)
 	}
