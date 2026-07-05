@@ -48,6 +48,14 @@ func main() {
 
 	telegramToken := os.Getenv("TELEGRAMTOKEN")
 	geminiKey := os.Getenv("GEMINIKEY")
+
+	if telegramToken == "" {
+		log.Fatal("TELEGRAMTOKEN is not set")
+	}
+	if geminiKey == "" {
+		log.Fatal("GEMINIKEY is not set")
+	}
+
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: "2006-01-02 15:04:05",
@@ -117,9 +125,8 @@ func main() {
 }
 
 func loadEnv() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	if err := godotenv.Load(); err != nil {
+		log.Warning(".env not found, using system environment variables")
 	}
 }
 

@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  belly-ledger:
+    build: .
+    container_name: belly-ledger
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
