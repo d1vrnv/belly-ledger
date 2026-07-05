@@ -3,16 +3,17 @@ package db
 import "time"
 
 type Meal struct {
-	ID          uint   `gorm:"primaryKey"`
-	UserID      uint   `gorm:"not null;index"`
-	User        User   `gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
-	Description string `gorm:"type:text"`
-	Healthiness string `gorm:"type:text"`
-	Calories    int
-	Protein     int
-	Fats        int
-	Carbs       int
-	CreatedAt   time.Time
+	ID              uint   `gorm:"primaryKey"`
+	UserID          uint   `gorm:"not null;index"`
+	User            User   `gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
+	Description     string `gorm:"type:text"`
+	Healthiness     string `gorm:"type:text"`
+	Calories        int
+	Protein         int
+	Fats            int
+	Carbs           int
+	CreatedAt       time.Time
+	SourceMessageID int // original Telegram request message
 }
 
 func (d *DB) GetCaloriesToday(userID uint) (int, error) {
@@ -36,15 +37,39 @@ func (d *DB) GetCaloriesToday(userID uint) (int, error) {
 	return totalCalories, err
 }
 
-func (d *DB) AddMeal(userID uint, description, healthiness string, calories, protein, fats, carbs int) error {
+func (d *DB) AddMeal(userID uint, description, healthiness string, calories, protein, fats, carbs int, SourceMessageID int) (*Meal, error) {
 	newMeal := &Meal{
-		UserID:      userID,
-		Description: description,
-		Healthiness: healthiness,
-		Calories:    calories,
-		Protein:     protein,
-		Fats:        fats,
-		Carbs:       carbs,
+		UserID:          userID,
+		Description:     description,
+		Healthiness:     healthiness,
+		Calories:        calories,
+		Protein:         protein,
+		Fats:            fats,
+		Carbs:           carbs,
+		SourceMessageID: SourceMessageID,
 	}
-	return d.conn.Create(newMeal).Error
+
+	if err := d.conn.Create(newMeal).Error; err != nil {
+		return nil, err
+	}
+
+	return newMeal, nil
+}
+
+func (d *DB) DeleteMeal(mealId uint) error {
+	err := d.conn.Delete(&Meal{}, mealId).Error
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DB) GetMealByID(id uint) (*Meal, error) {
+	var meal Meal
+
+	if err := d.conn.First(&meal, id).Error; err != nil {
+		return nil, err
+	}
+
+	return &meal, nil
 }

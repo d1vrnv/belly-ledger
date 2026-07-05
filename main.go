@@ -92,6 +92,11 @@ func main() {
 	updates := bot.GetUpdatesChan(updateConfig)
 
 	for update := range updates {
+		if update.CallbackQuery != nil {
+			handleCallback(bot, database, update)
+			continue
+		}
+
 		if update.Message == nil {
 			continue
 		}
@@ -461,8 +466,9 @@ func processMealRequest(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.U
 	var replyText string
 	if err != nil {
 		replyText = fmt.Sprintf("Error: %v", err)
+		updateOrSendMessage(bot, chatID, processingMsg.MessageID, replyText)
 	} else {
-		err := database.AddMeal(user.ID, result.FoodDescription, result.HealthinessExplanation, result.Calories, result.Protein, result.Fats, result.Carbs)
+		meal, err := database.AddMeal(user.ID, result.FoodDescription, result.HealthinessExplanation, result.Calories, result.Protein, result.Fats, result.Carbs, update.Message.MessageID)
 		if err != nil {
 			log.Errorf("Processing meal error: %v", err)
 		}
@@ -480,8 +486,74 @@ func processMealRequest(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.U
 			totalCalories,
 			user.Goal,
 		)
+		err = sendAnalyticsResponse(bot, chatID, processingMsg.MessageID, replyText, meal.ID)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendAnalyticsResponse(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	messageID int,
+	replyText string,
+	mealID uint,
+) error {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				"🗑 Delete this entry",
+				fmt.Sprintf("delete_meal:%d", mealID),
+			),
+		),
+	)
+
+	msg := tgbotapi.NewEditMessageText(chatID, messageID, replyText)
+	msg.ReplyMarkup = &keyboard
+
+	_, err := bot.Send(msg)
+	return err
+}
+
+func handleCallback(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update) {
+	if update.CallbackQuery == nil {
+		return
 	}
 
-	updateOrSendMessage(bot, chatID, processingMsg.MessageID, replyText)
-	return nil
+	q := update.CallbackQuery
+	if _, err := bot.Request(tgbotapi.NewCallback(q.ID, "")); err != nil {
+		log.Println("answer callback failed:", err)
+		return
+	}
+	if strings.HasPrefix(q.Data, "delete_meal:") {
+		idStr := strings.TrimPrefix(q.Data, "delete_meal:")
+		mealID, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			log.Println("parse meal id error:", err)
+			return
+		}
+
+		meal, err := database.GetMealByID(uint(mealID))
+		if err != nil {
+			log.Println("get meal error:", err)
+			return
+		}
+
+		if err := database.DeleteMeal(uint(mealID)); err != nil {
+			log.Println("delete meal error:", err)
+			return
+		}
+
+		_, err = bot.Request(tgbotapi.NewDeleteMessage(q.Message.Chat.ID, meal.SourceMessageID))
+		if err != nil {
+			log.Println("delete original photo error:", err)
+		}
+
+		_, err = bot.Request(tgbotapi.NewDeleteMessage(q.Message.Chat.ID, q.Message.MessageID))
+		if err != nil {
+			log.Println("delete telegram message error:", err)
+		}
+	}
 }
