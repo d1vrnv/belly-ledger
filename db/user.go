@@ -50,7 +50,7 @@ func (d *DB) GetUserByTelegramID(telegramID int64) (*User, error) {
 	return &user, nil
 }
 
-func (d *DB) UpdateUserData(telegramID int64, height, weight int, age int, gender string) error {
+func (d *DB) UpdateUserData(telegramID int64, height, weight int, age int, gender string) (*User, error) {
 	result := d.conn.Model(&User{}).
 		Where("telegram_id = ?", telegramID).
 		Updates(map[string]interface{}{
@@ -63,14 +63,14 @@ func (d *DB) UpdateUserData(telegramID int64, height, weight int, age int, gende
 		})
 
 	if result.Error != nil {
-		return result.Error
+		return nil, result.Error
 	}
 
 	if result.RowsAffected == 0 {
-		return errors.New("user not found")
+		return nil, errors.New("user not found")
 	}
 
-	return nil
+	return d.GetUserByTelegramID(telegramID)
 }
 
 func calculateBMI(weightKg, heightCm int) float64 {

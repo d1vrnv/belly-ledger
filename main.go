@@ -115,11 +115,13 @@ func main() {
 			continue
 		}
 
+		if messageText == "/update" {
+			updateUserProfile(bot, update, chatID, pendingReplies)
+			continue
+		}
+
 		pending, hasPending := pendingReplies[update.Message.From.ID]
-		if hasPending &&
-			update.Message.ReplyToMessage != nil &&
-			update.Message.ReplyToMessage.MessageID == pending.ReplyToMessageID &&
-			pending.Kind == "user_profile" {
+		if hasPending && pending.Kind == "user_profile" {
 			err := processPendingReply(bot, database, update, pendingReplies)
 			if err != nil {
 				continue
@@ -286,11 +288,10 @@ func handleUserProfileReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbota
 		return fmt.Errorf("invalid gender")
 	}
 	user, err := database.GetUserByTelegramID(update.Message.From.ID)
-	var newUser *db.User
 
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			newUser, err = database.AddUser(update.Message.From.ID, update.Message.From.FirstName, height, weight, age, gender)
+			user, err = database.AddUser(update.Message.From.ID, update.Message.From.FirstName, height, weight, age, gender)
 			if err != nil {
 				return err
 			}
@@ -298,10 +299,9 @@ func handleUserProfileReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbota
 			return err
 		}
 	} else {
-		if err := database.UpdateUserData(update.Message.From.ID, height, weight, age, gender); err != nil {
+		if user, err = database.UpdateUserData(update.Message.From.ID, height, weight, age, gender); err != nil {
 			return err
 		}
-		_ = user
 	}
 
 	genderLine := "♂️ Male"
@@ -320,12 +320,18 @@ func handleUserProfileReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbota
 		weight,
 		age,
 		genderLine,
-		newUser.BMI,
-		bmiCategory(newUser.BMI),
+		user.BMI,
+		bmiCategory(user.BMI),
 	)
 
-	msg := tgbotapi.NewMessage(update.Message.Chat.ID, text)
-	_, _ = bot.Send(msg)
+	confirm := tgbotapi.NewMessage(update.Message.Chat.ID, text)
+	confirm.ReplyMarkup = tgbotapi.ReplyKeyboardRemove{
+		RemoveKeyboard: true,
+		Selective:      true,
+	}
+	if _, err := bot.Send(confirm); err != nil {
+		log.Println("failed to send confirmation message:", err)
+	}
 
 	return nil
 }
@@ -339,33 +345,7 @@ func startMessage(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update,
 	_, err := database.GetUserByTelegramID(update.Message.From.ID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			text := "Send height, weight, age and gender (m/f) in one message.\n\n" +
-				"Examples:\n" +
-				"180 75 25 m\n" +
-				"165 60 30 f\n\n" +
-				"ℹ️ Age and gender are needed for accurate calorie calculation using Mifflin-St Jeor formula. Without them, a simplified calculation is used."
-
-			replyMsg := tgbotapi.NewMessage(chatID, text)
-			replyMsg.ReplyMarkup = tgbotapi.ForceReply{
-				ForceReply:            true,
-				InputFieldPlaceholder: "180 75 25 m",
-				Selective:             true,
-			}
-			replyMsg.ReplyToMessageID = update.Message.MessageID
-
-			sent, sendErr := bot.Send(replyMsg)
-
-			if sendErr == nil {
-				pendingReplies[update.Message.From.ID] = PendingReply{
-					ChatID:           chatID,
-					UserID:           update.Message.From.ID,
-					ReplyToMessageID: sent.MessageID,
-					Kind:             "user_profile",
-				}
-			} else {
-				log.Warning("send welcome error:", sendErr)
-			}
-
+			updateUserProfile(bot, update, chatID, pendingReplies)
 		} else {
 			errMsg := tgbotapi.NewMessage(chatID, "Sorry, I couldn't check your profile right now.")
 			bot.Send(errMsg)
@@ -561,5 +541,34 @@ func handleCallback(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Updat
 		if err != nil {
 			log.Println("delete telegram message error:", err)
 		}
+	}
+}
+
+func updateUserProfile(bot *tgbotapi.BotAPI, update tgbotapi.Update, chatID int64, pendingReplies map[int64]PendingReply) {
+	text := "Send height, weight, age and gender (m/f) in one message.\n\n" +
+		"Examples:\n" +
+		"180 75 25 m\n" +
+		"165 60 30 f\n\n" +
+		"ℹ️ Age and gender are needed for accurate calorie calculation using Mifflin-St Jeor formula. Without them, a simplified calculation is used."
+
+	replyMsg := tgbotapi.NewMessage(chatID, text)
+	replyMsg.ReplyMarkup = tgbotapi.ForceReply{
+		ForceReply:            true,
+		InputFieldPlaceholder: "180 75 25 m",
+		Selective:             true,
+	}
+	replyMsg.ReplyToMessageID = update.Message.MessageID
+
+	sent, sendErr := bot.Send(replyMsg)
+
+	if sendErr == nil {
+		pendingReplies[update.Message.From.ID] = PendingReply{
+			ChatID:           chatID,
+			UserID:           update.Message.From.ID,
+			ReplyToMessageID: sent.MessageID,
+			Kind:             "user_profile",
+		}
+	} else {
+		log.Warning("send welcome error:", sendErr)
 	}
 }
