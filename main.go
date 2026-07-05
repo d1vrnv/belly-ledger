@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,11 @@ type PendingReply struct {
 func main() {
 	loadEnv()
 	var pendingReplies = map[int64]PendingReply{} // key: telegram user id
+
+	dbPath := "./data/belly.db"
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		log.Fatalf("failed to create db directory: %v", err)
+	}
 
 	database, err := db.Connect("./data/belly.db")
 	if err != nil {
