@@ -96,3 +96,21 @@ func calculateBMR(weightKg, heightCm, age int, gender string) int {
 		return 0
 	}
 }
+
+func (d *DB) UpdateUserTarget(telegramID int64, goal int) (*User, error) {
+	result := d.conn.Model(&User{}).
+		Where("telegram_id = ?", telegramID).
+		Updates(map[string]interface{}{
+			"goal": goal,
+		})
+
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	if result.RowsAffected == 0 {
+		return nil, errors.New("user not found")
+	}
+
+	return d.GetUserByTelegramID(telegramID)
+}

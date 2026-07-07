@@ -120,9 +120,22 @@ func main() {
 			continue
 		}
 
+		if messageText == "/set_target" {
+			updateUserTarget(bot, database, update, chatID, pendingReplies)
+			continue
+		}
+
 		pending, hasPending := pendingReplies[update.Message.From.ID]
 		if hasPending && pending.Kind == "user_profile" {
-			err := processPendingReply(bot, database, update, pendingReplies)
+			err := processProfileReply(bot, database, update, pendingReplies)
+			if err != nil {
+				continue
+			}
+			continue
+		}
+
+		if hasPending && pending.Kind == "user_target" {
+			err := processTargetReply(bot, database, update, pendingReplies)
 			if err != nil {
 				continue
 			}
@@ -353,7 +366,7 @@ func startMessage(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update,
 	}
 }
 
-func processPendingReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, pendingReplies map[int64]PendingReply) error {
+func processProfileReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, pendingReplies map[int64]PendingReply) error {
 	err := handleUserProfileReply(bot, database, update)
 	if err != nil {
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Couldn't parse that. Use format: 180 75 25 m")
@@ -571,4 +584,66 @@ func updateUserProfile(bot *tgbotapi.BotAPI, update tgbotapi.Update, chatID int6
 	} else {
 		log.Warning("send welcome error:", sendErr)
 	}
+}
+
+func updateUserTarget(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, chatID int64, pendingReplies map[int64]PendingReply) {
+
+	user, err := database.GetUserByTelegramID(update.Message.From.ID)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "You need register your profile first /start"))
+		return
+	}
+
+	text := fmt.Sprintf(
+		"Reply with your new daily target in the next message.\nYour current target is %v.",
+		user.Goal,
+	)
+
+	replyMsg := tgbotapi.NewMessage(chatID, text)
+
+	replyMsg.ReplyToMessageID = update.Message.MessageID
+
+	sent, sendErr := bot.Send(replyMsg)
+
+	if sendErr == nil {
+		pendingReplies[update.Message.From.ID] = PendingReply{
+			ChatID:           chatID,
+			UserID:           update.Message.From.ID,
+			ReplyToMessageID: sent.MessageID,
+			Kind:             "user_target",
+		}
+	} else {
+		log.Warning("send welcome error:", sendErr)
+	}
+}
+
+func processTargetReply(bot *tgbotapi.BotAPI, database *db.DB, update tgbotapi.Update, pendingReplies map[int64]PendingReply) error {
+	parts := strings.Fields(strings.TrimSpace(strings.ToLower(update.Message.Text)))
+	if len(parts) != 1 {
+		return fmt.Errorf("invalid format")
+	}
+
+	target, err := strconv.Atoi(parts[0])
+
+	if err != nil {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Couldn't parse that. Target must be a number")
+		bot.Send(msg)
+		return err
+	}
+
+	user, err := database.UpdateUserTarget(update.Message.From.ID, target)
+	if err != nil {
+		return err
+	}
+
+	delete(pendingReplies, update.Message.From.ID)
+
+	text := fmt.Sprintf("You updated your daily calorie target to %v.", user.Goal)
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID, text)
+	_, err = bot.Send(msg)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
